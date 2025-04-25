@@ -1,0 +1,389 @@
+#include <SPI.h>
+#include <WiFi.h>
+#include "esp_timer.h"
+
+
+// ✅ 设置你的 WiFi 信息
+const char *ssid = "sylv";      // 你的WiFi名称
+const char *password = "11112222"; // WiFi密码
+WiFiServer server(8080);  // ✅ TCP 服务器端口号 8080
+WiFiClient clients[4];    // ✅ 支持最多 4 个设备连接
+
+// Define macros for register configuration
+#define CONFIG_1 0xC5
+#define CONFIG_2 0xC0
+#define CONFIG_3 0xE0
+#define CHnSET 0x60 
+#define ENABLE_SRB1 0x20
+#define BIAS_SENSP 0xFF
+#define BIAS_SENSN 0xFF
+#define LEAD_OFF_CURRENT 0x00
+#define ENABLE_POSITIVE_LEAD_OFF 0x00
+#define ENABLE_NEGATIVE_LEAD_OFF 0x00
+
+// Define mode constants
+#define MODE_CONTINUOUS_READ 1
+#define MODE_IMPEDANCE_MEASURE 2
+#define MODE_SELF_TEST 3
+
+int currentMode = MODE_CONTINUOUS_READ;  // Current mode
+volatile bool dataReady = false;         // Flag indicating new data is ready
+double channelDataBuffer[9];             // Buffer to hold 9-channel data
+
+// Global variable to monitor last valid SPI read time (in ms)
+unsigned long lastValidReadTime = 0;
+const unsigned long READ_TIMEOUT = 2000; // Timeout threshold of 2000ms
+
+// Function declarations
+void IRAM_ATTR onDRDYInterrupt();  // DRDY pin interrupt service routine
+
+void setup();
+void loop();
+void startContinuousReadMode();
+void startImpedanceMeasurementMode();
+void startSelfTestMode(); 
+void initADS1299();
+void measureImpedance();
+void getDeviceID();
+void sendCommand(byte cmd);
+void writeRegister(byte reg, byte value);
+byte readRegister(byte reg);
+void readData();
+void convertData(byte *data, double *channelData);
+
+//
+// Define pins
+//
+#define CS_PIN    5     // Chip Select pin
+#define SCLK_PIN  18    // VSPI SCLK pin
+#define MOSI_PIN  23    // VSPI MOSI pin
+#define MISO_PIN  19    // VSPI MISO pin
+#define DRDY_PIN  36    // DRDY pin
+#define START_PIN 4     // START pin
+#define RESET_PIN 2     // RESET pin
+
+//
+// Command definitions
+//
+#define WAKEUP  0x02
+#define STANDBY  0x04
+#define RESET   0x06
+#define START   0x08
+#define STOP    0x0A
+#define RDATAC  0x10
+#define SDATAC  0x11
+#define RDATA   0x12
+#define RREG    0x20
+#define WREG    0x40
+
+void setup() {
+  // Initialize Serial for debugging
+  Serial.begin(115200);
+
+  // ✅ 连接 WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+  }
+  Serial.println("\nWiFi connected.");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());  // ✅ 打印 ESP32 的 IP 地址
+
+  server.begin();  // ✅ 启动 TCP 服务器
+
+  // Initialize pins
+  pinMode(CS_PIN, OUTPUT);
+  pinMode(SCLK_PIN, OUTPUT);
+  pinMode(MOSI_PIN, OUTPUT);
+  pinMode(MISO_PIN, INPUT);
+  pinMode(DRDY_PIN, INPUT);
+  pinMode(START_PIN, OUTPUT);
+  pinMode(RESET_PIN, OUTPUT);
+
+  digitalWrite(CS_PIN, LOW);
+  digitalWrite(START_PIN, LOW);
+  digitalWrite(RESET_PIN, HIGH);
+  delay(100);
+
+  // Initialize SPI
+  SPI.begin(SCLK_PIN, MISO_PIN, MOSI_PIN, CS_PIN);
+  SPI.setBitOrder(MSBFIRST);
+  SPI.setDataMode(SPI_MODE1);
+  SPI.setClockDivider(SPI_CLOCK_DIV8);  // Approximately 5 MHz
+
+  // Initialize ADS1299
+  initADS1299();
+  getDeviceID();
+  Serial.println("ADS1299 initialized");
+
+  // Attach external interrupt (trigger on falling edge of DRDY)
+  attachInterrupt(digitalPinToInterrupt(DRDY_PIN), onDRDYInterrupt, FALLING);
+
+  // Automatically start continuous read mode
+  currentMode = MODE_CONTINUOUS_READ;
+  startContinuousReadMode();
+  // Initialize the last valid read time
+  lastValidReadTime = millis();
+}
+
+
+
+// ✅ 处理新的客户端连接
+void checkNewClient() {
+    WiFiClient newClient = server.available();
+    if (newClient) {
+        // ✅ 查找空位存储新客户端
+        for (int i = 0; i < 4; i++) {
+            if (!clients[i]) {
+                clients[i] = newClient;
+                Serial.print("New client connected: ");
+                Serial.println(i);
+                return;
+            }
+        }
+        // ✅ 如果满了，则拒绝新连接
+        newClient.stop();
+        Serial.println("Max clients reached, rejecting new connection.");
+    }
+}
+
+
+void loop() {
+  // Optional: Process Serial input to switch modes
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    Serial.print("Received: ");
+    Serial.println(cmd);
+    if (cmd == '1') {
+      currentMode = MODE_CONTINUOUS_READ;
+      startContinuousReadMode();
+    } else if (cmd == '2') {
+      currentMode = MODE_IMPEDANCE_MEASURE;
+      startImpedanceMeasurementMode();
+    } else if (cmd == '3') {
+      currentMode = MODE_SELF_TEST;
+      startSelfTestMode();
+    }
+  }
+  
+  // If new data is ready, print it out
+  if (dataReady) {
+    dataReady = false;
+    Serial.print("Channel:");
+    for (int i = 0; i < 9; i++) {
+      Serial.print(channelDataBuffer[i], 6);
+      if (i != 8) {
+        Serial.print(",");
+      } else {
+        Serial.println("");
+      }
+    }
+    // Update the last valid read time each time we get data
+    lastValidReadTime = millis();
+  }
+  
+  // Monitor SPI connection by checking if data is received within the timeout period.
+  if (currentMode == MODE_CONTINUOUS_READ && (millis() - lastValidReadTime > READ_TIMEOUT)) {
+    Serial.println("No valid SPI data for 2 seconds. Restarting continuous read mode...");
+    startContinuousReadMode();
+    lastValidReadTime = millis();  // Reset timer after restarting mode
+  }
+  checkNewClient();  // ✅ 检查新的客户端连接
+
+  if (dataReady) {
+      dataReady = false;
+
+        // ✅ 构造 EEG 数据字符串
+      String dataString = "";
+      for (int i = 0; i < 9; i++) {
+          dataString += String(channelDataBuffer[i], 6);
+          if (i != 8) dataString += ",";
+      }
+      dataString += "\n";  // ✅ TCP 需要换行符，方便 PC 解析
+
+        // ✅ 遍历所有客户端，发送 EEG 数据
+      for (int i = 0; i < 4; i++) {
+          if (clients[i] && clients[i].connected()) {
+              clients[i].print(dataString);
+          } else {
+              clients[i].stop();  // ✅ 断开的连接清理
+          }
+      }
+  }
+}
+
+
+
+// DRDY interrupt service routine
+void IRAM_ATTR onDRDYInterrupt() {
+  if (currentMode == MODE_CONTINUOUS_READ) {
+    readData();  // Read data
+  } else if (currentMode == MODE_IMPEDANCE_MEASURE) {
+    measureImpedance();  // Measure impedance
+  } else if (currentMode == MODE_SELF_TEST) {
+    readData();  // Read data
+  }
+}
+
+void startContinuousReadMode() {
+  sendCommand(RESET);
+  delay(100);
+  sendCommand(SDATAC);
+  // Configure registers using macros
+  writeRegister(0x01, CONFIG_1);
+  writeRegister(0x02, CONFIG_2);
+  writeRegister(0x03, CONFIG_3);
+  writeRegister(0x04, 0x00);
+  for (int i = 0x05; i <= 0x0C; i++) {
+    writeRegister(i, CHnSET);
+  }
+  writeRegister(0x0D, BIAS_SENSP);
+  writeRegister(0x0E, BIAS_SENSN);
+  writeRegister(0x15, ENABLE_SRB1); // Enable SRB1
+
+  // Start continuous data read
+  sendCommand(START);
+  sendCommand(RDATAC);
+}
+
+void startImpedanceMeasurementMode() {
+  sendCommand(RESET);
+  delay(100);
+  sendCommand(SDATAC);
+  writeRegister(0x0F, LEAD_OFF_CURRENT); // Set lead-off current
+  writeRegister(0x18, ENABLE_POSITIVE_LEAD_OFF); // Enable positive lead-off detection
+  writeRegister(0x19, ENABLE_NEGATIVE_LEAD_OFF); // Enable negative lead-off detection
+}
+
+void startSelfTestMode() {
+  sendCommand(RESET);
+  delay(100);
+  sendCommand(SDATAC);
+  // Configure registers to enable internal test signal
+  writeRegister(0x01, 0xD4);
+  writeRegister(0x02, 0x10);
+  writeRegister(0x03, 0xEC);
+  writeRegister(0x04, 0x00); // Enable SRB1 in MISC1 register
+  // Set all channels to internal test signal
+  for (int i = 0x05; i <= 0x0C; i++) {
+    writeRegister(i, 0x65);
+  }
+  // Start continuous data read
+  sendCommand(START);
+  sendCommand(RDATAC);
+}
+
+void initADS1299() {
+  sendCommand(RESET);
+  delay(100);
+  sendCommand(65);
+  // Configure registers using macros
+  writeRegister(0x01, CONFIG_1); 
+  writeRegister(0x02, CONFIG_2);
+  writeRegister(0x03, CONFIG_3);
+  writeRegister(0x04, 0x00); // MISC1 register
+  for (int i = 0x05; i <= 0x0C; i++) {
+    writeRegister(i, CHnSET); // Set PGA gain and input type for each channel
+  }
+  writeRegister(0x0D, BIAS_SENSP);
+  writeRegister(0x0E, BIAS_SENSN);
+  writeRegister(0x15, ENABLE_SRB1); // Enable SRB1
+  sendCommand(START);
+  sendCommand(RDATAC); // Start continuous data read mode
+}
+
+void readData() {
+  byte data[27];
+  digitalWrite(CS_PIN, LOW);
+  for (int i = 0; i < 27; i++) {
+    data[i] = SPI.transfer(0x00);
+  }
+  digitalWrite(CS_PIN, HIGH);
+  // Convert data and save result to global buffer
+  convertData(data, channelDataBuffer);
+  // Set flag indicating data is ready
+  dataReady = true;
+}
+
+void measureImpedance() {
+  byte data[27];
+  digitalWrite(CS_PIN, LOW);
+  for (int i = 0; i < 27; i++) {
+    data[i] = SPI.transfer(0x00);
+  }
+  digitalWrite(CS_PIN, HIGH);
+  
+  double channelData[9];
+  convertData(data, channelData);
+  Serial.print("Channel:");
+  for (int i = 0; i < 9; i++) {
+    Serial.print(channelData[i], 6);
+    if (i != 8) {
+      Serial.print(",");
+    } else {
+      Serial.println("");
+    }
+  }
+  Serial.print("Impedance Measurement:");
+  for (int i = 0; i < 8; i++) {
+    double voltage = channelData[i];
+    double current = 0.000006; // Assumed 6nA lead current
+    double impedance = voltage / current;
+    Serial.print(impedance, 2);
+    if (i != 7) {
+      Serial.print(",");
+    } else {
+      Serial.println("");
+    }
+  }
+}
+
+void convertData(byte *data, double *channelData) {
+  // Parse STATUS register
+  long statusValue = ((long)data[0] << 16) | ((long)data[1] << 8) | data[2];
+  channelData[0] = (double)statusValue;  // Save STATUS in first position
+
+  // Parse 8 channels of data
+  for (int i = 0; i < 8; i++) {
+    long value = ((long)data[3 * i + 3] << 16) | ((long)data[3 * i + 4] << 8) | data[3 * i + 5];
+    if (value & 0x800000) {
+      value |= 0xFF000000;  // Sign extension
+    }
+    channelData[i + 1] = (double)value * 4.5 / (double)0x7FFFFF;
+  }
+}
+
+void sendCommand(byte cmd) {
+  digitalWrite(CS_PIN, LOW);
+  SPI.transfer(cmd);
+  digitalWrite(CS_PIN, HIGH);
+}
+
+void writeRegister(byte reg, byte value) {
+  digitalWrite(CS_PIN, LOW);
+  SPI.transfer(WREG | reg);
+  SPI.transfer(0x00);
+  SPI.transfer(value);
+  digitalWrite(CS_PIN, HIGH);
+}
+
+byte readRegister(byte reg) {
+  digitalWrite(CS_PIN, LOW);
+  SPI.transfer(RREG | reg);
+  SPI.transfer(0x00);
+  byte value = SPI.transfer(0x00);
+  digitalWrite(CS_PIN, HIGH);
+  return value;
+}
+
+void getDeviceID() {
+  digitalWrite(CS_PIN, LOW);
+  SPI.transfer(SDATAC);
+  SPI.transfer(RREG | 0x00);
+  SPI.transfer(0x00);
+  byte data = SPI.transfer(0x00);
+  digitalWrite(CS_PIN, HIGH);
+  Serial.print("Device ID: ");
+  Serial.println(data, BIN);
+}
